@@ -869,73 +869,200 @@ def loop_color(user_id):
 
 # ----- Functions to be implemented are below
 
-# Task 3.1
+# Task 3.3
 def recommend(user_id, filter_following):
     """
+    Returns a list of 5 recommended posts for the user.
+
     Args:
-        user_id: The ID of the current user.
-        filter_following: Boolean, True if we only want to see recommendations from followed users.
+        user_id (int): Current user's ID.
+        filter_following (bool): If True, only show posts from followed users.
 
     Returns:
-        A list of 5 recommended posts, in reverse-chronological order.
-
-    To test whether your recommendation algorithm works, let's pretend we like the DIY topic. Here are some users that often post DIY comment and a few example posts. Make sure your account did not engage with anything else. You should test your algorithm with these and see if your recommendation algorithm picks up on your interest in DIY and starts showing related content.
-    
-    Users: @starboy99, @DancingDolphin, @blogger_bob
-    Posts: 1810, 1875, 1880, 2113
-    
-    Materials: 
-    - https://www.nvidia.com/en-us/glossary/recommendation-system/
-    - http://www.configworks.com/mz/handout_recsys_sac2010.pdf
-    - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
+        List[dict]: Top 5 recommended posts in reverse-chronological order.
     """
 
-    recommended_posts = {} 
+    # Get content of posts the user reacted to
+    liked_posts = query_db('''
+        SELECT p.content
+        FROM posts p
+        JOIN reactions r ON p.id = r.post_id
+        WHERE r.user_id = ?
+    ''', (user_id,))
 
-    return recommended_posts;
+    # If user has no reactions then show newest posts
+    if not liked_posts:
+        return query_db('''
+            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+            FROM posts p
+            JOIN users u ON p.user_id = u.id
+            WHERE p.user_id != ?
+            ORDER BY p.created_at DESC
+            LIMIT 5
+        ''', (user_id,))
+
+    # Build keyword frequency from liked posts
+    word_counts = collections.Counter()
+    stop_words = {'a', 'an', 'the', 'in', 'on', 'is', 'it', 'to', 'for', 'of', 'and', 'with'}
+
+    for post in liked_posts:
+        words = re.findall(r'\b\w+\b', post['content'].lower())
+        for w in words:
+            if w not in stop_words and len(w) > 2:
+                word_counts[w] += 1
+
+    top_keywords = [w for w, _ in word_counts.most_common(10)]
+    
+    # Get candidate posts
+    query = '''
+        SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+        FROM posts p
+        JOIN users u ON p.user_id = u.id
+    '''
+    params = []
+
+    if filter_following:
+        query += ' WHERE p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)'
+        params.append(user_id)
+
+    candidate_posts = query_db(query, tuple(params))
+
+    # Exclude own and already liked posts
+    liked_ids = {p['id'] for p in query_db(
+        'SELECT post_id as id FROM reactions WHERE user_id = ?', (user_id,)
+    )}
+
+    recommendations = []
+    for post in candidate_posts:
+        if post['id'] in liked_ids or post['user_id'] == user_id:
+            continue
+        # If any top keyword appears in content then consider relevant
+        if any(k in post['content'].lower() for k in top_keywords):
+            recommendations.append(post)
+
+    # Sort by newest and take top 5
+    recommendations.sort(key=lambda p: p['created_at'], reverse=True)
+    return recommendations[:5]
+
 
 # Task 3.2
 def user_risk_analysis(user_id):
     """
-    Args:
-        user_id: The ID of the user on which we perform risk analysis.
-
-    Returns:
-        A float number score showing the risk associated with this user. There are no strict rules or bounds to this score, other than that a score of less than 1.0 means no risk, 1.0 to 3.0 is low risk, 3.0 to 5.0 is medium risk and above 5.0 is high risk. (An upper bound of 5.0 is applied to this score elsewhere in the codebase) 
-        
-        You will be able to check the scores by logging in with the administrator account:
-            username: admin
-            password: admin
-        Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
+    Calculates an overall risk score for a given user based on:
+      • profile text
+      • their posts
+      • their comments
     """
-    
-    score = 0
+    user_row = query_db("SELECT id, profile, created_at FROM users WHERE id = ?", (user_id,), one=True)
+    if not user_row:
+        return 0.0
 
-    return score;
+    account_created = user_row["created_at"]
+    account_age_days = (datetime.utcnow() - account_created).days
+
+    # Profile Score
+    _, profile_score = moderate_content(user_row["profile"] or "")
+
+    # Posts (average score)
+    user_posts = query_db("SELECT content FROM posts WHERE user_id = ?", (user_id,))
+    post_scores = []
+    for post in user_posts:
+        _, base_score = moderate_content(post["content"])
+        if account_age_days < 7:
+            base_score *= 1.5
+        post_scores.append(base_score)
+    average_post_score = sum(post_scores) / len(post_scores) if post_scores else 0.0
+
+    # Comments (average score)
+    user_comments = query_db("SELECT content FROM comments WHERE user_id = ?", (user_id,))
+    comment_scores = []
+    for comment in user_comments:
+        _, base_score = moderate_content(comment["content"])
+        if account_age_days < 7:
+            base_score *= 1.5
+        comment_scores.append(base_score)
+    average_comment_score = sum(comment_scores) / len(comment_scores) if comment_scores else 0.0
+
+    # Combine Scores (weighted)
+    content_risk_score = (profile_score * 1) + (average_post_score * 3) + (average_comment_score * 1)
+
+    # Apply Age Multiplier 
+    if account_age_days < 7:
+        user_risk_score = content_risk_score * 1.5
+    elif account_age_days < 30:
+        user_risk_score = content_risk_score * 1.2
+    else:
+        user_risk_score = content_risk_score
+
+    final_score = min(5.0, round(user_risk_score, 2))
+
+    return final_score
 
     
-# Task 3.3
+# Task 3.1
 def moderate_content(content):
     """
-    Args
-        content: the text content of a post or comment to be moderated.
+    Automatically detects and censors inappropriate user posts, comments, or introductions.
+
+    Args:
+        content (str): The text content of a post or comment to be moderated.
+
+    Returns:
+        tuple: (moderated_content (str), severity_score (float))
         
-    Returns: 
-        A tuple containing the moderated content (string) and a severity score (float). There are no strict rules or bounds to the severity score, other than that a score of less than 1.0 means no risk, 1.0 to 3.0 is low risk, 3.0 to 5.0 is medium risk and above 5.0 is high risk.
-    
-    This function moderates a string of content and calculates a severity score based on
-    rules loaded from the 'censorship.dat' file. These are already loaded as TIER1_WORDS, TIER2_PHRASES and TIER3_WORDS. Tier 1 corresponds to strong profanity, Tier 2 to scam/spam phrases and Tier 3 to mild profanity.
-    
-    You will be able to check the scores by logging in with the administrator account:
-            username: admin
-            password: admin
-    Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
+    Scoring thresholds:
+        <1.0  → No risk
+        1.0–3.0 → Low risk
+        3.0–5.0 → Medium risk
+        >5.0 → High risk
     """
 
-    moderated_content = content
-    score = 0
-    
-    return moderated_content, score
+    original_content = content
+    score = 0.0
+
+    # Rule 1.1.1: Tier 1 Words (Severe Profanity)
+    TIER1_PATTERN = r'\b(' + '|'.join(TIER1_WORDS) + r')\b'
+    if re.search(TIER1_PATTERN, content, flags=re.IGNORECASE):
+        return "[content removed due to severe violation]", 5.0
+
+    # Rule 1.1.2: Tier 2 Phrases (Spam/Scam)
+    for phrase in TIER2_PHRASES:
+        if re.search(re.escape(phrase), content, flags=re.IGNORECASE):
+            return "[content removed due to spam/scam policy]", 5.0
+
+    # Stage 1.2: Scored Violations & Filtering
+    moderated_content = original_content
+
+    # Rule 1.2.1: Tier 3 Words (Mild Profanity)
+    if TIER3_WORDS:
+        TIER3_PATTERN = r'\b(' + '|'.join(TIER3_WORDS) + r')\b'
+        matches = re.findall(TIER3_PATTERN, moderated_content, flags=re.IGNORECASE)
+        score += len(matches) * 2.0
+        moderated_content = re.sub(TIER3_PATTERN, lambda m: '*' * len(m.group(0)), moderated_content, flags=re.IGNORECASE        )
+
+    # Rule 1.2.2: External Links
+    URL_PATTERN = r'(https?://[^\s]+|www\.[^\s]+)'
+    url_matches = re.findall(URL_PATTERN, moderated_content)
+    if url_matches:
+        score += len(url_matches) * 2.0
+        moderated_content = re.sub(URL_PATTERN, '[link removed]', moderated_content)
+
+    # Rule 1.2.3: Excessive Capitalization
+    letters = re.findall(r'[A-Za-z]', moderated_content)
+    if len(letters) > 15:
+        uppercase_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
+        if uppercase_ratio > 0.7:
+            score += 0.5  # small risk addition
+
+    #Additional Moderation Measure (New Rule),Personal Information (email addresses)
+    EMAIL_PATTERN = r'\b[A-Za-z0-9._%+-]+@+[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    email_matches = re.findall(EMAIL_PATTERN, moderated_content)
+    if email_matches:
+        score += 1.0
+        moderated_content = re.sub(EMAIL_PATTERN, '[email removed]', moderated_content)
+
+    return moderated_content.strip(), score
+
 
 
 if __name__ == '__main__':
