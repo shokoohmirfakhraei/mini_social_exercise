@@ -107,6 +107,8 @@
                         <th>Author</th>
                         <th>Content</th>
                         <th>Created At</th>
+                        <th>Reposts</th>
+                        <th>Reports</th>
                         <th>Risk Level</th>
                         <th>Actions</th>
                     </tr>
@@ -118,6 +120,8 @@
                         <td><a href="{{ url_for('user_profile', username=post.username) }}">{{ post.username }}</a></td>
                         <td style="max-width: 400px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="{{ post.content }}"><a href="{{ url_for('post_detail', post_id=post.id) }}">{{ post.content }}</a></td>
                         <td>{{ post.created_at|datetimeformat }}</td>
+                        <td>{{ post.repost_count }}</td>
+                        <td>{{ post.report_count }}</td>
                         <td>
                             {% if post.risk_label == "HIGH" %}
                                 <span class="badge bg-danger">HIGH</span>
