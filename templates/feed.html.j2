@@ -74,6 +74,13 @@
         {% else %}
         <small class="text-muted">{{ entry.post.created_at|datetimeformat }}</small>
         {% endif %}
+        {% if entry.post.original_author %}
+          <small class="text-muted d-block mt-1">
+            🔁 Reposted from 
+            <a href="/u/{{ entry.post.original_author }}">{{ entry.post.original_author }}</a>
+          </small>
+        {% endif %}
+
       </div>
       
       <p class="mt-2">{{ entry.post.content }}</p>
@@ -124,6 +131,11 @@
         </div>
         {% endif %}
       </div>
+      {% if session.get('user_id') and entry.post.user_id != session.get('user_id') %}
+        <form action="{{ url_for('repost', post_id=entry.post.id) }}" method="POST" class="d-inline">
+          <button type="submit" class="btn btn-outline-secondary btn-sm mt-2">🔁 Repost</button>
+        </form>
+      {% endif %}
 
 
      {% if entry.comments %}
