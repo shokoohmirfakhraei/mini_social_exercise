@@ -94,7 +94,44 @@ REACTION_EMOJIS = {
 }
 REACTION_TYPES = list(REACTION_EMOJIS.keys())
 
+@app.route('/posts/<int:post_id>/report_post', methods=['POST'])
+def report_post(post_id):
+    """Handles reporting a post."""
+    user_id = session.get('user_id')
 
+    # Block access if user is not logged in
+    if not user_id:
+        flash('You must be logged in to report a post.', 'danger')
+        return redirect(url_for('login'))
+
+    # Find the post in the database
+    post = query_db('SELECT id, user_id FROM posts WHERE id = ?', (post_id,), one=True)
+
+    # Check if the post exists and if the current user is the owner
+    if not post:
+        flash('Post not found.', 'danger')
+        return redirect(url_for('feed'))
+
+    if post['user_id'] == user_id:
+        # Security check: prevent users from reporting their own posts.
+        flash('You do can not report your own post.', 'danger')
+        return redirect(request.referrer)
+    
+    # Check if the user already submitted a report
+    report = query_db('SELECT * FROM post_reports WHERE reporter_id = ? AND post_id = ?', (user_id, post_id,), one=True)
+    if report:
+        flash('You already submitted a report for this post.', 'danger')
+        return redirect(request.referrer)
+
+    # If all checks pass, proceed with report
+    db = get_db()
+    db.execute('INSERT INTO post_reports (post_id, reporter_id) VALUES (?, ?)', (post_id, user_id))
+    db.commit()
+
+    flash('The post was successfully reported.', 'success')
+    
+    # Redirect back to the page the user came from, or the feed as a fallback
+    return redirect(request.referrer or url_for('feed'))
 @app.route('/')
 def feed():
     #  1. Get Pagination and Filter Parameters 
@@ -138,11 +175,20 @@ def feed():
         posts = query_db(query, final_params)
     elif sort == 'recommended':
         posts = recommend(current_user_id, show == 'following' and current_user_id)
-    else:  # Default sort is 'new'
+    else:  # Default sort is 'new' (now includes reposts)
         query = f"""
-            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+            SELECT 
+                p.id, 
+                p.content, 
+                p.created_at, 
+                u.username, 
+                u.id as user_id,
+                p.original_post_id, 
+                u2.username AS original_author
             FROM posts p
             JOIN users u ON p.user_id = u.id
+            LEFT JOIN posts op ON p.original_post_id = op.id
+            LEFT JOIN users u2 ON op.user_id = u2.id
             {where_clause}
             ORDER BY p.created_at DESC
             LIMIT ? OFFSET ?
@@ -174,15 +220,26 @@ def feed():
             if reaction_check:
                 user_reaction = reaction_check['reaction_type']
 
-        reactions = query_db('SELECT reaction_type, COUNT(*) as count FROM reactions WHERE post_id = ? GROUP BY reaction_type', (post['id'],))
-        comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post['id'],))
+        reactions = query_db(
+            'SELECT reaction_type, COUNT(*) as count FROM reactions WHERE post_id = ? GROUP BY reaction_type',
+            (post['id'],)
+        )
+        comments_raw = query_db(
+            'SELECT c.id, c.content, c.created_at, u.username, u.id as user_id \
+             FROM comments c JOIN users u ON c.user_id = u.id \
+             WHERE c.post_id = ? ORDER BY c.created_at ASC',
+            (post['id'],)
+        )
+
         post_dict = dict(post)
         post_dict['content'], _ = moderate_content(post_dict['content'])
+
         comments_moderated = []
         for comment in comments_raw:
             comment_dict = dict(comment)
             comment_dict['content'], _ = moderate_content(comment_dict['content'])
             comments_moderated.append(comment_dict)
+
         posts_data.append({
             'post': post_dict,
             'reactions': reactions,
@@ -192,14 +249,16 @@ def feed():
         })
 
     #  4. Render Template with Pagination Info 
-    return render_template('feed.html.j2', 
-                           posts=posts_data, 
-                           current_sort=sort,
-                           current_show=show,
-                           page=page, # Pass current page number
-                           per_page=POSTS_PER_PAGE, # Pass items per page
-                           reaction_emojis=REACTION_EMOJIS,
-                           reaction_types=REACTION_TYPES)
+    return render_template(
+        'feed.html.j2', 
+        posts=posts_data, 
+        current_sort=sort,
+        current_show=show,
+        page=page,
+        per_page=POSTS_PER_PAGE,
+        reaction_emojis=REACTION_EMOJIS,
+        reaction_types=REACTION_TYPES
+    )
 
 @app.route('/posts/new', methods=['POST'])
 def add_post():
@@ -577,6 +636,38 @@ def add_reaction():
 
     return redirect(request.referrer or url_for('feed'))
 
+@app.route('/posts/<int:post_id>/repost', methods=['POST'])
+def repost(post_id):
+    """Allows a user to repost another user's post."""
+    user_id = session.get('user_id')
+
+    # Security: check if logged in
+    if not user_id:
+        flash("You must be logged in to repost.", "danger")
+        return redirect(url_for('login'))
+
+    # Get the original post
+    original = query_db('SELECT id, user_id, content FROM posts WHERE id = ?', (post_id,), one=True)
+    if not original:
+        flash("Original post not found.", "danger")
+        return redirect(url_for('feed'))
+
+    # Prevent self-reposting
+    if original['user_id'] == user_id:
+        flash("You cannot repost your own content.", "warning")
+        return redirect(request.referrer)
+
+    # Insert repost
+    db = get_db()
+    db.execute("""
+        INSERT INTO posts (user_id, content, original_post_id, reposter_id)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, original['content'], original['id'], user_id))
+    db.commit()
+
+    flash("Post successfully reposted!", "success")
+    return redirect(url_for('feed'))
+
 @app.route('/unreact', methods=['POST'])
 def unreact():
     """Handles removing a user's reaction from a post."""
@@ -730,11 +821,29 @@ def admin_dashboard():
     total_posts_pages = (total_posts_count + PAGE_SIZE - 1) // PAGE_SIZE
 
     posts_raw = query_db(f'''
-        SELECT p.id, p.content, p.created_at, u.username, u.created_at as user_created_at
-        FROM posts p JOIN users u ON p.user_id = u.id
-        ORDER BY p.id DESC -- Order by ID for consistent pagination before risk sort
-        LIMIT ? OFFSET ?
-    ''', (PAGE_SIZE, posts_offset))
+      SELECT 
+          p.id, 
+          p.content, 
+          p.created_at, 
+          u.username, 
+          u.created_at as user_created_at,
+          COUNT(pr.id) as report_count,
+          COUNT(DISTINCT rp.id) as repost_count
+                         
+      FROM 
+          posts p 
+      JOIN 
+          users u ON p.user_id = u.id
+      LEFT JOIN 
+          post_reports pr ON p.id = pr.post_id
+      LEFT JOIN 
+          posts rp ON rp.original_post_id = p.id
+      GROUP BY 
+          p.id
+      ORDER BY 
+          p.id DESC
+      LIMIT ? OFFSET ?
+  ''', (PAGE_SIZE, posts_offset))
     posts = []
     for post in posts_raw:
         post_dict = dict(post)
